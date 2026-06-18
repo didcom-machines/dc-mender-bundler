@@ -1,0 +1,16 @@
+services:
+  mender-bundler:
+    build: .
+    ports:
+      - "8888:8888"
+    volumes:
+      # Docker socket — lets the container run docker commands on the host daemon.
+      # Windows (Docker Desktop): use //var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace — mount the directory that contains your compose projects.
+      # All paths you type in the UI must be under /workspace inside the container.
+      # Windows example:  - C:/Users/you/projects:/workspace
+      # Linux / macOS:    - ~/projects:/workspace
+      - ./workspace:/workspace
+    environment:
+      - PYTHONUNBUFFERED=1

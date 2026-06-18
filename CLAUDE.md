@@ -1,8 +1,8 @@
 # dc-mender-bundler
 
-Web GUI for packaging Docker Compose projects into Mender OTA artifacts. Single-file Python app (`bundle-gui.py`). All HTML/CSS/JS is embedded — no external JS dependencies.
+Web GUI for packaging Docker Compose projects into Mender OTA artifacts. All HTML/CSS/JS lives in `static/index.html` — no external JS dependencies.
 
-## Run
+## Run (native)
 
 ```bash
 pip install pyyaml
@@ -10,7 +10,23 @@ sudo apt install python3-tk   # for native file picker dialogs
 python3 bundle-gui.py         # opens http://localhost:8888
 ```
 
-Optional flags: `--port <n>`, `--no-browser`.
+Optional flags: `--port <n>`, `--host <addr>`, `--no-browser`.
+
+## Run (Docker — Windows / any platform)
+
+Place the `gen_docker-compose` binary in the project root, then:
+
+```bash
+# Windows: edit docker-compose.yml → change /var/run/docker.sock to //var/run/docker.sock
+# Edit the workspace volume to point at your projects directory
+docker compose up --build
+```
+
+Open `http://localhost:8888`. All paths typed in the UI must use the container-side path (e.g. `/workspace/my-project/docker-compose.yml`). The file picker (🗀 button) is unavailable in Docker — type paths manually.
+
+The `docker-compose.yml` mounts:
+- `/var/run/docker.sock` — so the container can run `docker` commands on the host daemon
+- `./workspace` → `/workspace` — replace with your actual projects directory
 
 ---
 
@@ -49,6 +65,27 @@ gen_docker-compose \
 
 ---
 
+## Project layout
+
+```
+dc-mender-bundler/
+├── bundle-gui.py        # thin entry point — argparse → app.server.start()
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── static/
+│   └── index.html       # all HTML / CSS / JS (no external deps)
+└── app/
+    ├── compose.py        # YAML parsing + generation
+    ├── builder.py        # build pipeline (_run, run_build_job)
+    ├── dialog.py         # tkinter file picker
+    └── server.py         # HTTP handler (Handler) + start()
+```
+
+`app/server.py` loads `static/index.html` once at import time via `Path(__file__).parent.parent / "static" / "index.html"`.
+
+---
+
 ## bundle-gui.py — design
 
 ### UI layout
@@ -77,7 +114,7 @@ The `tar` type exists because cross-compiled images (e.g. `linux/arm64` built on
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/` | Serve embedded HTML |
+| GET | `/` | Serve `static/index.html` |
 | GET | `/images/local` | List local Docker images |
 | GET | `/images/search?q=` | Search Docker Hub |
 | POST | `/browse` | Native file/directory picker (tkinter) |
