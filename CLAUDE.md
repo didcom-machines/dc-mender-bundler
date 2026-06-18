@@ -1,12 +1,12 @@
 # dc-mender-bundler
 
-Web GUI for packaging Docker Compose projects into Mender OTA artifacts. Single-file Python app (`bundle-gui.py`). No external JS dependencies — all HTML/CSS/JS is embedded in the Python file.
+Web GUI for packaging Docker Compose projects into Mender OTA artifacts. Single-file Python app (`bundle-gui.py`). All HTML/CSS/JS is embedded — no external JS dependencies.
 
 ## Run
 
 ```bash
 pip install pyyaml
-sudo apt install python3-tk   # for native file picker
+sudo apt install python3-tk   # for native file picker dialogs
 python3 bundle-gui.py         # opens http://localhost:8888
 ```
 
@@ -14,102 +14,64 @@ Optional flags: `--port <n>`, `--no-browser`.
 
 ---
 
-## Why this exists
+## What it does
 
-The target platform is an **automotive infotainment device** running embedded Linux with Docker. Images are cross-compiled for `linux/arm64` on a developer x86 machine. Because these images never exist in any registry, the standard Mender workflow (pull from registry on device) does not apply — images must be bundled into the `.mender` artifact alongside the compose manifest.
+1. Define a Docker Compose project visually (or import an existing `docker-compose.yml`)
+2. Build or collect images for a target architecture
+3. Bundle everything into a `.mender` artifact using `gen_docker-compose`
 
----
-
-## Three-tier RPC architecture (the system this tool deploys for)
-
-```
-Browser / Client containers
-        │  HTTP POST /rpc
-        ▼
-  ┌─────────────────────────────────┐
-  │  Tier 2 — Gateway container     │  image: gateway-arm64:latest
-  │  Flask HTTP → Unix socket proxy │  container: hardware-gateway
-  │  Port 8765:80 (host:container)  │  network: hardware-gateway-net
-  └─────────────────────────────────┘
-        │  Unix socket
-        ▼
-  /tmp/rpc_server.sock  (Tier 1 — host RPC server, systemd service)
-  Whitelist: /etc/rpc-server/whitelist_config.json
-```
-
-- **Tier 1** validates every command against a whitelist. Default: no commands allowed.
-- **Tier 2** (gateway) bridges HTTP ↔ Unix socket. CORS controlled via `CORS_ORIGINS` env var.
-- **Tier 3** (client containers) call `http://hardware-gateway/rpc` — no port needed because they're on `hardware-gateway-net`.
-
-### RPC request format
-
-```json
-POST /rpc
-{ "jsonrpc": "2.0", "method": "execute", "params": ["command", "arg1", "arg2"], "id": 1 }
-```
-
-`params[0]` is the command; `params[1:]` are its arguments. The `method` field is ignored by the host server.
-
-### Network ownership rule
-
-The **gateway project owns** `hardware-gateway-net`. Other compose projects join it as:
-```yaml
-networks:
-  hardware-gateway-net:
-    external: true
-```
+The output is a self-contained `.mender` file containing the compose manifest and all image tarballs, ready to deploy via the Mender server.
 
 ---
 
-## Mender deployment
+## Mender artifact structure
 
-### Tool
+`gen_docker-compose` (Northern.tech official tool, must be at `/usr/bin/gen_docker-compose`) expects:
 
-`/usr/bin/gen_docker-compose` — Northern.tech official Update Module generator.
+```
+output-dir/
+├── images/
+│   ├── service-a.tar     ← one per service (docker save output)
+│   └── service-b.tar
+└── manifests/
+    └── docker-compose.yml   ← image: references only, no build:
+```
 
 ```bash
 gen_docker-compose \
   --artifact-name  my-project-v1.0.0 \
-  --device-type    automotive-infotainment-lite \
-  --project-name   my-project \          # [a-zA-Z0-9_-] only
-  --manifests-dir  ./manifests \
-  --images-dir     ./images \
+  --device-type    my-device-type \
+  --project-name   my-project \        # [a-zA-Z0-9_-] only
+  --manifests-dir  output-dir/manifests \
+  --images-dir     output-dir/images \
   --output-path    my-project-v1.0.0.mender
 ```
 
-### Required directory structure
-
-```
-project/
-├── images/
-│   ├── service-a.tar     ← docker save output
-│   └── service-b.tar
-└── manifests/
-    └── docker-compose.yml   ← image: only, no build:
-```
-
-### One-project constraint
-
-The docker-compose Update Module uses `--clears-provides "*mender-docker-compose_*"`. **Deploying project B removes project A.** Each artifact is a full project replacement, not an additive update.
-
-### Rollback
-
-If `ArtifactCommit` fails (health check unhealthy), Mender runs `ArtifactRollback` automatically — tears down the new composition, restores the previous one.
-
-### Port publishing on target
-
-The target kernel requires these modules for Docker port publishing to work:
-- `CONFIG_IP_NF_RAW=y`
-- `CONFIG_IP_NF_FILTER=y`
-- `CONFIG_NF_CONNTRACK=y`
-- `CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y`
-- `CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y`
-
-Without `iptable_raw`, any `ports:` mapping fails with `Table does not exist`.
-
 ---
 
-## bundle-gui.py — architecture
+## bundle-gui.py — design
+
+### UI layout
+
+All sections are always visible (no step wizard). Import just pre-populates the same editor used when creating from scratch.
+
+| Section | Purpose |
+|---------|---------|
+| Compose Project | Import bar + visual builder (left) + live YAML editor (right) |
+| Dockerfiles | Tabbed editor per `build`-type service, appears automatically |
+| Project Structure | Source directory tree + output directory tree (live preview) |
+| Build Configuration | Architecture, artifact name, project name, device type, output dir |
+| Build Output | Streaming log via SSE |
+
+### Service types
+
+| Type | How the image ends up in `images/` |
+|------|------------------------------------|
+| `image` | `docker images -q` check → use local if found; else `docker pull --platform <arch>` then `docker save` |
+| `build` | `docker buildx build --platform <arch> --load` → `docker save` |
+| `tar` | `shutil.copy2(tarPath, images_dir/name.tar)` — no Docker involved |
+
+The `tar` type exists because cross-compiled images (e.g. `linux/arm64` built on an x86 machine) often don't exist in any registry. The tar path is not representable in docker-compose YAML, so `startBuild()` sends the full `services` array in the POST body alongside the compose path; the backend reads `tarPath` from there instead of re-parsing the YAML.
 
 ### Backend endpoints
 
@@ -120,44 +82,21 @@ Without `iptable_raw`, any `ports:` mapping fails with `Table does not exist`.
 | GET | `/images/search?q=` | Search Docker Hub |
 | POST | `/browse` | Native file/directory picker (tkinter) |
 | POST | `/read-file` | Read a file from disk → content string |
-| POST | `/write-file` | Write content string → file on disk |
-| POST | `/parse-yaml` | Parse YAML string → services + networks |
+| POST | `/write-file` | Write content string → file (creates dirs) |
+| POST | `/parse-yaml` | Parse YAML string → services + networks list |
 | POST | `/parse` | Parse compose file by path → services |
-| POST | `/start` | Launch build job, returns `{jobId}` |
-| GET | `/stream/{jobId}` | SSE stream of build log lines |
-
-### Service types
-
-| Type | How the image gets into `images/` |
-|------|----------------------------------|
-| `image` | `docker images -q` check → skip pull if local; else `docker pull` |
-| `build` | `docker buildx build --platform <arch> --load` → `docker save` |
-| `tar` | `shutil.copy2(tarPath, images_dir/name.tar)` — no Docker involved |
-
-**Important**: tar path is not representable in docker-compose YAML. `startBuild()` sends the full `services` array in the POST body so the backend has `tarPath` per service. The backend uses `params["services"]` when present instead of re-parsing the compose file.
+| POST | `/start` | Launch background build job → `{jobId}` |
+| GET | `/stream/{jobId}` | SSE stream of build log lines + `done` event |
 
 ### YAML editor sync
 
-- Visual builder → YAML: debounced 300 ms, JS-side `jsYaml()` serializer (no round-trip)
-- YAML → visual builder: `↓ Apply` button calls `POST /parse-yaml` → rebuilds service cards
-- Import: fills both YAML editor and visual cards simultaneously
+- **Visual builder → YAML**: debounced 300 ms, client-side `jsYaml()` serializer (no network round-trip)
+- **YAML → visual builder**: `↓ Apply` button calls `POST /parse-yaml` → rebuilds service cards
+- **Import**: fills both YAML textarea and visual service cards simultaneously
 
 ### Dockerfile editors
 
-Appear automatically when any service is type `build`. One tab per build service. Load/Save buttons read and write the actual file from disk via `/read-file` and `/write-file`.
-
----
-
-## Key files in the broader project (outside this repo)
-
-| Path | Description |
-|------|-------------|
-| `/home/manuelmonge/socket/gateway/gateway.py` | Flask gateway service |
-| `/home/manuelmonge/socket/gateway/manifests/docker-compose.yml` | Gateway Mender deployment manifest |
-| `/home/manuelmonge/socket/gateway/create-artifact.sh` | Gateway artifact build script |
-| `/home/manuelmonge/socket/client_demo/manifests/docker-compose.yml` | Client demo deployment manifest |
-| `/home/manuelmonge/socket/client_demo/create-artifact.sh` | Client demo artifact build script |
-| `/home/manuelmonge/socket/MENDER_BUNDLE_GUIDE.md` | Full manual bundling guide |
+Appear as a tabbed card whenever at least one service is type `build`. Each tab has Load (reads file from disk via `/read-file`) and Save (writes via `/write-file`) buttons. Tab key inserts 4-space indentation.
 
 ---
 
